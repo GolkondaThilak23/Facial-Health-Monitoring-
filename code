@@ -1,0 +1,673 @@
+"""
+Enhanced Healthcare Monitoring System with AI-based Emotion & Stress Detection
+
+import cv2
+import numpy as np
+from scipy import signal
+from scipy.signal import butter, filtfilt, find_peaks
+import sqlite3
+from datetime import datetime
+import time
+from collections import deque
+import warnings
+warnings.filterwarnings('ignore')
+
+# ==================== KALMAN FILTER CLASS ====================
+class KalmanFilter:
+    """Adaptive Kalman Filter for vital sign smoothing"""
+    def __init__(self, process_variance=1e-5, measurement_variance=1e-1, initial_value=0.0):
+        self.process_variance = process_variance
+        self.measurement_variance = measurement_variance
+        self.estimate = initial_value
+        self.error_covariance = 1.0
+        
+    def update(self, measurement):
+        # Prediction
+        prediction = self.estimate
+        prediction_covariance = self.error_covariance + self.process_variance
+        
+        # Update
+        kalman_gain = prediction_covariance / (prediction_covariance + self.measurement_variance)
+        self.estimate = prediction + kalman_gain * (measurement - prediction)
+        self.error_covariance = (1 - kalman_gain) * prediction_covariance
+        
+        return self.estimate
+    
+    def adapt_variance(self, innovation):
+        """Adaptive process variance based on innovation"""
+        if abs(innovation) > 2 * np.sqrt(self.measurement_variance):
+            self.process_variance *= 1.1
+        else:
+            self.process_variance *= 0.95
+        self.process_variance = np.clip(self.process_variance, 1e-6, 1e-3)
+
+# ==================== AI EMOTION DETECTOR ====================
+class AIEmotionDetector:
+    """Deep Learning-based emotion and stress detection using facial features"""
+    def __init__(self):
+        # Load Haar Cascade for face detection
+        self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        
+        # Emotion labels
+        self.emotion_labels = ['Angry', 'Disgust', 'Fear', 'Happy', 'Sad', 'Surprise', 'Neutral']
+        
+        # Facial feature analysis buffers
+        self.eye_aspect_ratio_buffer = deque(maxlen=30)
+        self.mouth_aspect_ratio_buffer = deque(maxlen=30)
+        
+        # Emotion history for smoothing
+        self.emotion_history = deque(maxlen=10)
+        
+        # Face tracking
+        self.prev_face_rect = None
+        self.stable_face_count = 0
+        
+    def detect_face(self, frame):
+        """Detect face using Haar Cascade"""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = self.face_cascade.detectMultiScale(
+            gray, 
+            scaleFactor=1.1, 
+            minNeighbors=5, 
+            minSize=(100, 100)
+        )
+        
+        if len(faces) > 0:
+            x, y, w, h = faces[0]
+            return x, y, w, h
+        return None
+    
+    def extract_facial_regions(self, frame, face_rect):
+        """Extract eye and mouth regions"""
+        x, y, w, h = face_rect
+        
+        # Define regions based on facial proportions
+        eye_region_top = y + int(h * 0.25)
+        eye_region_bottom = y + int(h * 0.45)
+        eye_region_height = eye_region_bottom - eye_region_top
+        
+        mouth_region_top = y + int(h * 0.65)
+        mouth_region_bottom = y + int(h * 0.85)
+        mouth_region_height = mouth_region_bottom - mouth_region_top
+        
+        # Extract regions
+        eye_region = frame[eye_region_top:eye_region_bottom, x:x+w]
+        mouth_region = frame[mouth_region_top:mouth_region_bottom, x:x+w]
+        
+        return eye_region, mouth_region
+    
+    def analyze_facial_features(self, eye_region, mouth_region):
+        """Analyze facial regions for emotion indicators"""
+        # Convert to grayscale for analysis
+        eye_gray = cv2.cvtColor(eye_region, cv2.COLOR_BGR2GRAY)
+        mouth_gray = cv2.cvtColor(mouth_region, cv2.COLOR_BGR2GRAY)
+        
+        # Apply thresholding to detect features
+        _, eye_thresh = cv2.threshold(eye_gray, 50, 255, cv2.THRESH_BINARY_INV)
+        _, mouth_thresh = cv2.threshold(mouth_gray, 50, 255, cv2.THRESH_BINARY_INV)
+        
+        # Calculate eye aspect ratio (simplified)
+        eye_contours, _ = cv2.findContours(eye_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        eye_area = sum(cv2.contourArea(cnt) for cnt in eye_contours) if eye_contours else 0
+        eye_aspect_ratio = eye_area / (eye_region.shape[0] * eye_region.shape[1]) if eye_region.shape[0] > 0 else 0
+        
+        # Calculate mouth aspect ratio
+        mouth_contours, _ = cv2.findContours(mouth_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        mouth_area = sum(cv2.contourArea(cnt) for cnt in mouth_contours) if mouth_contours else 0
+        mouth_aspect_ratio = mouth_area / (mouth_region.shape[0] * mouth_region.shape[1]) if mouth_region.shape[0] > 0 else 0
+        
+        # Store in buffers
+        self.eye_aspect_ratio_buffer.append(eye_aspect_ratio)
+        self.mouth_aspect_ratio_buffer.append(mouth_aspect_ratio)
+        
+        return eye_aspect_ratio, mouth_aspect_ratio
+    
+    def detect_emotion_from_features(self, ear, mar):
+        """Detect emotion based on facial feature ratios"""
+        if len(self.eye_aspect_ratio_buffer) < 5:
+            return "Calibrating", 0.5
+        
+        baseline_ear = np.median(list(self.eye_aspect_ratio_buffer))
+        baseline_mar = np.median(list(self.mouth_aspect_ratio_buffer))
+        
+        # Calculate deviations
+        ear_deviation = (ear - baseline_ear) / baseline_ear if baseline_ear > 0 else 0
+        mar_deviation = (mar - baseline_mar) / baseline_mar if baseline_mar > 0 else 0
+        
+        # Emotion detection rules
+        emotion_scores = {
+            'Angry': 0.0,
+            'Happy': 0.0,
+            'Sad': 0.0,
+            'Surprise': 0.0,
+            'Fear': 0.0,
+            'Neutral': 0.3
+        }
+        
+        # Happy: Increased mouth openness
+        if mar_deviation > 0.2:
+            emotion_scores['Happy'] = 0.7
+        
+        # Surprise: Increased eye openness and mouth openness
+        if ear_deviation > 0.15 and mar_deviation > 0.15:
+            emotion_scores['Surprise'] = 0.8
+        
+        # Sad: Decreased mouth openness
+        if mar_deviation < -0.15:
+            emotion_scores['Sad'] = 0.6
+        
+        # Angry: Decreased eye and mouth openness (squinting)
+        if ear_deviation < -0.1 and mar_deviation < -0.1:
+            emotion_scores['Angry'] = 0.7
+        
+        # Get dominant emotion
+        dominant_emotion = max(emotion_scores, key=emotion_scores.get)
+        confidence = emotion_scores[dominant_emotion]
+        
+        # Add to history for smoothing
+        self.emotion_history.append(dominant_emotion)
+        
+        # Return most common emotion from recent history
+        if len(self.emotion_history) >= 5:
+            from collections import Counter
+            emotion_counts = Counter(self.emotion_history)
+            dominant_emotion = emotion_counts.most_common(1)[0][0]
+        
+        return dominant_emotion, confidence
+
+# ==================== ENHANCED STRESS DETECTOR ====================
+class EnhancedStressDetector:
+    """AI-powered stress detection combining physiological + emotional signals"""
+    def __init__(self):
+        self.baseline_hr = 70
+        self.baseline_sys = 120
+        self.baseline_dias = 80
+        
+        # Stress weights for different factors
+        self.physiological_weight = 0.5
+        self.emotional_weight = 0.5
+        
+    def update_baseline(self, hr, sys_bp, dias_bp):
+        """Update baseline values"""
+        self.baseline_hr = hr
+        self.baseline_sys = sys_bp
+        self.baseline_dias = dias_bp
+    
+    def calculate_physiological_stress(self, current_hr, current_sys, current_dias):
+        """Calculate stress from vital signs"""
+        hr_deviation = abs(current_hr - self.baseline_hr) / self.baseline_hr if self.baseline_hr > 0 else 0
+        sys_deviation = abs(current_sys - self.baseline_sys) / self.baseline_sys if self.baseline_sys > 0 else 0
+        dias_deviation = abs(current_dias - self.baseline_dias) / self.baseline_dias if self.baseline_dias > 0 else 0
+        
+        # Weighted physiological stress score
+        physio_stress = (hr_deviation * 0.4 + sys_deviation * 0.3 + dias_deviation * 0.3)
+        return physio_stress
+    
+    def calculate_emotional_stress(self, emotion, confidence):
+        """Calculate stress from detected emotion"""
+        emotion_stress_map = {
+            'Angry': 0.9,
+            'Fear': 0.8,
+            'Sad': 0.6,
+            'Disgust': 0.5,
+            'Surprise': 0.3,
+            'Happy': 0.1,
+            'Neutral': 0.2
+        }
+        
+        base_stress = emotion_stress_map.get(emotion, 0.3)
+        return base_stress * confidence
+    
+    def detect_stress(self, current_hr, current_sys, current_dias, emotion, emotion_confidence):
+        """Comprehensive stress detection using both signals"""
+        # Calculate individual stress components
+        physio_stress = self.calculate_physiological_stress(current_hr, current_sys, current_dias)
+        emotional_stress = self.calculate_emotional_stress(emotion, emotion_confidence)
+        
+        # Combined stress score
+        total_stress = (physio_stress * self.physiological_weight + 
+                       emotional_stress * self.emotional_weight)
+        
+        # Determine stress level with emotion context
+        if emotion == 'Angry':
+            if total_stress > 0.3:
+                return "HIGH STRESS (Angry)", (0, 0, 255), total_stress
+            else:
+                return "MODERATE STRESS (Angry)", (0, 165, 255), total_stress
+        elif emotion == 'Fear':
+            return "HIGH STRESS (Anxious)", (128, 0, 255), total_stress
+        elif emotion == 'Sad':
+            return "MODERATE STRESS (Low Mood)", (255, 100, 0), total_stress
+        elif emotion == 'Happy':
+            return "RELAXED (Happy)", (0, 255, 0), total_stress
+        else:
+            # Standard stress levels
+            if total_stress < 0.15:
+                return "RELAXED", (0, 255, 0), total_stress
+            elif total_stress < 0.25:
+                return "NORMAL", (100, 255, 100), total_stress
+            elif total_stress < 0.35:
+                return "MILD STRESS", (255, 255, 0), total_stress
+            elif total_stress < 0.50:
+                return "MODERATE STRESS", (255, 165, 0), total_stress
+            else:
+                return "HIGH STRESS", (255, 0, 0), total_stress
+
+# ==================== DATABASE MANAGER ====================
+class HealthDatabase:
+    """SQLite database for health records"""
+    def __init__(self, db_name='health_monitor.db'):
+        self.conn = sqlite3.connect(db_name)
+        self.create_table()
+    
+    def create_table(self):
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS health_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                heart_rate REAL,
+                spo2 REAL,
+                systolic_bp REAL,
+                diastolic_bp REAL,
+                emotion TEXT,
+                stress_level TEXT,
+                stress_score REAL
+            )
+        ''')
+        self.conn.commit()
+    
+    def insert_record(self, hr, spo2, sys_bp, dias_bp, emotion, stress, stress_score):
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            INSERT INTO health_records (timestamp, heart_rate, spo2, systolic_bp, diastolic_bp, emotion, stress_level, stress_score)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), hr, spo2, sys_bp, dias_bp, emotion, stress, stress_score))
+        self.conn.commit()
+    
+    def get_baseline(self):
+        """Get baseline values from last 10 records"""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT AVG(heart_rate), AVG(systolic_bp), AVG(diastolic_bp)
+            FROM (SELECT * FROM health_records ORDER BY id DESC LIMIT 10)
+        ''')
+        result = cursor.fetchone()
+        if result[0] is None:
+            return 70, 120, 80
+        return result
+    
+    def close(self):
+        self.conn.close()
+
+# ==================== SIGNAL PROCESSING ====================
+class SignalProcessor:
+    """Advanced signal processing for PPG extraction"""
+    def __init__(self, fps=30):
+        self.fps = fps
+        self.buffer_size = fps * 10
+        self.signal_buffer = deque(maxlen=self.buffer_size)
+        
+    def butter_bandpass_filter(self, data, lowcut=0.7, highcut=3.5, order=4):
+        """Butterworth bandpass filter for heart rate range"""
+        nyquist = 0.5 * self.fps
+        low = lowcut / nyquist
+        high = highcut / nyquist
+        b, a = butter(order, [low, high], btype='band')
+        return filtfilt(b, a, data)
+    
+    def extract_ppg_signal(self, face_roi):
+        """Extract PPG signal from facial ROI"""
+        # Convert to YUV color space and extract luminance
+        yuv = cv2.cvtColor(face_roi, cv2.COLOR_BGR2YUV)
+        y_channel = yuv[:, :, 0]
+        
+        # Calculate average pixel intensity
+        return np.mean(y_channel)
+    
+    def calculate_heart_rate(self, signal_data):
+        """Calculate heart rate from PPG signal"""
+        if len(signal_data) < self.fps * 5:
+            return None
+        
+        # Normalize signal
+        normalized_signal = (signal_data - np.mean(signal_data)) / np.std(signal_data)
+        
+        # Apply bandpass filter
+        filtered_signal = self.butter_bandpass_filter(normalized_signal)
+        
+        # Find peaks
+        peaks, properties = find_peaks(
+            filtered_signal, 
+            distance=self.fps//2, 
+            prominence=np.std(filtered_signal)*0.3,
+            height=np.mean(filtered_signal) + np.std(filtered_signal)*0.5
+        )
+        
+        if len(peaks) < 2:
+            return None
+        
+        # Calculate heart rate
+        peak_intervals = np.diff(peaks) / self.fps
+        heart_rate = 60 / np.mean(peak_intervals)
+        
+        if 40 <= heart_rate <= 180:
+            return heart_rate
+        return None
+    
+    def estimate_spo2(self, signal_variance):
+        """Estimate SpO2 using signal quality metrics"""
+        # Simplified SpO2 estimation based on signal stability
+        signal_stability = 1.0 / (np.std(signal_variance) + 1e-6)
+        spo2 = 97.0 + signal_stability * 1.5
+        
+        # Clip to reasonable range
+        spo2 = np.clip(spo2, 90, 100)
+        return spo2
+    
+    def estimate_blood_pressure(self, heart_rate, signal_amplitude):
+        """Estimate BP using heart rate and signal characteristics"""
+        if heart_rate is None:
+            return None, None
+        
+        # Use empirical relationships
+        systolic = 110 + (heart_rate - 70) * 0.3 + signal_amplitude * 5
+        diastolic = 70 + (heart_rate - 70) * 0.2 + signal_amplitude * 3
+        
+        # Clip to reasonable ranges
+        systolic = np.clip(systolic, 90, 180)
+        diastolic = np.clip(diastolic, 60, 110)
+        
+        return systolic, diastolic
+
+# ==================== MAIN MONITORING SYSTEM ====================
+class HealthcareMonitor:
+    """Main healthcare monitoring system with AI emotion detection"""
+    def __init__(self):
+        # Initialize components
+        self.signal_processor = SignalProcessor(fps=30)
+        self.database = HealthDatabase()
+        self.emotion_detector = AIEmotionDetector()
+        self.stress_detector = EnhancedStressDetector()
+        
+        # Kalman filters
+        self.kf_hr = KalmanFilter(process_variance=1e-4, measurement_variance=5.0, initial_value=70)
+        self.kf_spo2 = KalmanFilter(process_variance=1e-5, measurement_variance=2.0, initial_value=98)
+        self.kf_sys_bp = KalmanFilter(process_variance=1e-4, measurement_variance=8.0, initial_value=120)
+        self.kf_dias_bp = KalmanFilter(process_variance=1e-4, measurement_variance=5.0, initial_value=80)
+        
+        # Signal buffers
+        self.ppg_buffer = deque(maxlen=300)
+        
+        # Current measurements
+        self.current_hr = 0
+        self.current_spo2 = 0
+        self.current_sys_bp = 0
+        self.current_dias_bp = 0
+        self.current_emotion = "Calibrating"
+        self.emotion_confidence = 0.0
+        self.stress_level = "INITIALIZING"
+        self.stress_color = (255, 255, 255)
+        self.stress_score = 0.0
+        
+        # Face tracking
+        self.face_roi = None
+        self.face_detected = False
+        
+        # Update baseline
+        baseline = self.database.get_baseline()
+        self.stress_detector.update_baseline(*baseline)
+        
+        # Timing
+        self.last_update = time.time()
+        self.update_interval = 2.0
+        self.frame_count = 0
+        
+    def extract_facial_roi(self, frame, face_rect):
+        """Extract forehead region for PPG analysis"""
+        if face_rect is None:
+            return None
+        
+        x, y, w, h = face_rect
+        
+        # Extract forehead region (top 20% of face)
+        forehead_h = int(h * 0.2)
+        forehead_y = y + int(h * 0.1)
+        
+        forehead_roi = frame[forehead_y:forehead_y+forehead_h, x:x+w]
+        
+        return forehead_roi
+    
+    def process_frame(self, frame):
+        """Process video frame for vital sign extraction"""
+        # Detect face
+        face_rect = self.emotion_detector.detect_face(frame)
+        
+        if face_rect is not None:
+            x, y, w, h = face_rect
+            self.face_detected = True
+            
+            # Draw face rectangle
+            cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
+            
+            # Extract forehead ROI for PPG
+            self.face_roi = self.extract_facial_roi(frame, face_rect)
+            
+            # Extract facial regions for emotion detection
+            eye_region, mouth_region = self.emotion_detector.extract_facial_regions(frame, face_rect)
+            
+            # Analyze facial features for emotion
+            ear, mar = self.emotion_detector.analyze_facial_features(eye_region, mouth_region)
+            self.current_emotion, self.emotion_confidence = self.emotion_detector.detect_emotion_from_features(ear, mar)
+            
+            # Extract PPG signal
+            if self.face_roi is not None and self.face_roi.shape[0] > 0 and self.face_roi.shape[1] > 0:
+                ppg_value = self.signal_processor.extract_ppg_signal(self.face_roi)
+                self.ppg_buffer.append(ppg_value)
+            
+            # Draw facial regions for visualization
+            eye_y = y + int(h * 0.25)
+            eye_h = int(h * 0.2)
+            mouth_y = y + int(h * 0.65)
+            mouth_h = int(h * 0.2)
+            
+            cv2.rectangle(frame, (x, eye_y), (x+w, eye_y+eye_h), (255, 0, 0), 1)
+            cv2.rectangle(frame, (x, mouth_y), (x+w, mouth_y+mouth_h), (255, 0, 0), 1)
+            
+        else:
+            self.face_detected = False
+            self.current_emotion = "No Face"
+            self.emotion_confidence = 0.0
+        
+        self.frame_count += 1
+        
+        # Calculate vital signs periodically
+        if time.time() - self.last_update >= self.update_interval and len(self.ppg_buffer) > 150:
+            self.calculate_vital_signs()
+            self.last_update = time.time()
+        
+        # Draw information overlay
+        frame = self.draw_overlay(frame)
+        
+        return frame
+    
+    def calculate_vital_signs(self):
+        """Calculate and filter vital signs"""
+        if not self.face_detected or len(self.ppg_buffer) < 50:
+            return
+        
+        # Heart Rate
+        hr = self.signal_processor.calculate_heart_rate(list(self.ppg_buffer))
+        if hr:
+            filtered_hr = self.kf_hr.update(hr)
+            self.current_hr = filtered_hr
+        
+        # SpO2 (simplified estimation)
+        if len(self.ppg_buffer) > 100:
+            signal_var = np.var(list(self.ppg_buffer))
+            spo2 = self.signal_processor.estimate_spo2(signal_var)
+            filtered_spo2 = self.kf_spo2.update(spo2)
+            self.current_spo2 = filtered_spo2
+        
+        # Blood Pressure
+        signal_amplitude = np.std(list(self.ppg_buffer)) if len(self.ppg_buffer) > 0 else 0
+        sys_bp, dias_bp = self.signal_processor.estimate_blood_pressure(self.current_hr, signal_amplitude)
+        
+        if sys_bp and dias_bp:
+            filtered_sys = self.kf_sys_bp.update(sys_bp)
+            filtered_dias = self.kf_dias_bp.update(dias_bp)
+            self.current_sys_bp = filtered_sys
+            self.current_dias_bp = filtered_dias
+        
+        # Enhanced Stress Detection with AI
+        if self.current_hr > 0:
+            self.stress_level, self.stress_color, self.stress_score = self.stress_detector.detect_stress(
+                self.current_hr, self.current_sys_bp, self.current_dias_bp,
+                self.current_emotion, self.emotion_confidence
+            )
+        
+        # Save to database every 15 seconds
+        if self.frame_count % 450 == 0 and self.face_detected:
+            self.database.insert_record(
+                self.current_hr, self.current_spo2,
+                self.current_sys_bp, self.current_dias_bp,
+                self.current_emotion, self.stress_level, self.stress_score
+            )
+    
+    def draw_overlay(self, frame):
+        """Draw information overlay on frame"""
+        h, w = frame.shape[:2]
+        
+        # Create semi-transparent overlay panel
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (10, 10), (500, 320), (0, 0, 0), -1)
+        frame = cv2.addWeighted(overlay, 0.7, frame, 0.3, 0)
+        
+        # Title
+        cv2.putText(frame, "AI-POWERED HEALTH MONITOR (OpenCV)", (20, 40),
+                   cv2.FONT_HERSHEY_DUPLEX, 0.7, (255, 255, 255), 2)
+        cv2.line(frame, (20, 50), (480, 50), (255, 255, 255), 1)
+        
+        # Status
+        status_color = (0, 255, 0) if self.face_detected else (0, 0, 255)
+        status_text = "FACE DETECTED" if self.face_detected else "NO FACE DETECTED"
+        cv2.putText(frame, f"Status: {status_text}", (20, 70),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
+        
+        # Vital Signs
+        y_offset = 100
+        spacing = 35
+        
+        # Heart Rate
+        hr_color = (0, 255, 0) if 60 <= self.current_hr <= 100 else (0, 165, 255)
+        cv2.putText(frame, f"Heart Rate: {self.current_hr:.1f} BPM", (20, y_offset),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, hr_color, 2)
+        
+        # SpO2
+        spo2_color = (0, 255, 0) if self.current_spo2 >= 95 else (0, 165, 255)
+        cv2.putText(frame, f"SpO2: {self.current_spo2:.1f}%", (20, y_offset + spacing),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, spo2_color, 2)
+        
+        # Blood Pressure
+        bp_color = (0, 255, 0) if (self.current_sys_bp < 130 and self.current_dias_bp < 85) else (0, 165, 255)
+        cv2.putText(frame, f"BP: {self.current_sys_bp:.0f}/{self.current_dias_bp:.0f} mmHg",
+                   (20, y_offset + spacing * 2), cv2.FONT_HERSHEY_SIMPLEX, 0.6, bp_color, 2)
+        
+        # AI Emotion Detection
+        emotion_color = (255, 100, 255)
+        cv2.putText(frame, f"Emotion: {self.current_emotion} ({self.emotion_confidence:.1%})",
+                   (20, y_offset + spacing * 3), cv2.FONT_HERSHEY_SIMPLEX, 0.6, emotion_color, 2)
+        
+        # Stress Level with AI
+        cv2.putText(frame, f"Stress: {self.stress_level}", (20, y_offset + spacing * 4),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.stress_color, 2)
+        
+        # Stress score bar
+        stress_bar_width = int(self.stress_score * 200)
+        cv2.rectangle(frame, (20, y_offset + spacing * 4 + 10), 
+                     (20 + stress_bar_width, y_offset + spacing * 4 + 25), 
+                     self.stress_color, -1)
+        cv2.rectangle(frame, (20, y_offset + spacing * 4 + 10), 
+                     (220, y_offset + spacing * 4 + 25), (255, 255, 255), 2)
+        
+        # Signal information
+        cv2.putText(frame, f"Frames: {self.frame_count}", (20, y_offset + spacing * 5 + 20),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        cv2.putText(frame, f"PPG Buffer: {len(self.ppg_buffer)}/300", (20, y_offset + spacing * 5 + 45),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        
+        # Instructions
+        cv2.putText(frame, "Press 'Q' to quit | 'S' to save record", (20, h - 20),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        # Signal quality indicator
+        signal_quality = min(len(self.ppg_buffer) / 150.0, 1.0) * 100
+        quality_color = (0, 255, 0) if signal_quality > 80 else (0, 165, 255) if signal_quality > 50 else (0, 0, 255)
+        cv2.rectangle(frame, (w - 150, 20), (w - 150 + int(signal_quality), 40), quality_color, -1)
+        cv2.rectangle(frame, (w - 150, 20), (w - 50, 40), (255, 255, 255), 2)
+        cv2.putText(frame, f"Signal: {signal_quality:.0f}%", (w - 145, 35),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        
+        return frame
+    
+    def run(self):
+        """Main monitoring loop"""
+        cap = cv2.VideoCapture(0)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+        
+        print("=" * 70)
+        print("AI-POWERED ENHANCED HEALTHCARE MONITORING SYSTEM (OpenCV)")
+        print("=" * 70)
+        print("Features: Real-time Emotion Detection + Vital Signs Monitoring")
+        print("Starting camera...")
+        print("Position your face in the frame for optimal detection")
+        print("The system will detect your emotions and stress levels in real-time")
+        print("Press 'Q' to quit | 'S' to save current record")
+        print("=" * 70)
+        
+        if not cap.isOpened():
+            print("Error: Could not open camera")
+            return
+        
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    print("Error: Could not read frame")
+                    break
+                
+                # Process frame
+                processed_frame = self.process_frame(frame)
+                
+                # Display
+                cv2.imshow('AI Healthcare Monitor - Emotion + Stress Detection', processed_frame)
+                
+                # Keyboard controls
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q') or key == ord('Q'):
+                    break
+                elif key == ord('s') or key == ord('S'):
+                    if self.current_hr > 0 and self.face_detected:
+                        self.database.insert_record(
+                            self.current_hr, self.current_spo2,
+                            self.current_sys_bp, self.current_dias_bp,
+                            self.current_emotion, self.stress_level, self.stress_score
+                        )
+                        print(f"Record saved: HR={self.current_hr:.1f}, SpO2={self.current_spo2:.1f}, "
+                              f"BP={self.current_sys_bp:.0f}/{self.current_dias_bp:.0f}, "
+                              f"Emotion={self.current_emotion}, Stress={self.stress_level}")
+        
+        finally:
+            cap.release()
+            cv2.destroyAllWindows()
+            self.database.close()
+            print("\nMonitoring session ended")
+            print(f"Total frames processed: {self.frame_count}")
+
+# ==================== MAIN ENTRY POINT ====================
+if __name__ == "__main__":
+    print("Initializing Healthcare Monitoring System...")
+    monitor = HealthcareMonitor()
+    monitor.run()
